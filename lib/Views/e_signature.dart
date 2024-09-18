@@ -3,7 +3,6 @@ import 'dart:io';
 import 'dart:ui' as ui;
 import 'dart:convert';
 import 'dart:typed_data';
-import 'package:e_signature/main.dart';
 import 'package:flutter/material.dart';
 import 'package:gallery_saver/gallery_saver.dart';
 import 'package:path_provider/path_provider.dart';
@@ -12,6 +11,7 @@ import 'package:syncfusion_flutter_signaturepad/signaturepad.dart';
 import 'package:camera/camera.dart';
 import 'package:dartssh2/dartssh2.dart';
 import 'package:flutter/services.dart' show rootBundle;
+import 'package:image/image.dart' as img;
 
 late List<CameraDescription> cameras;
 
@@ -24,11 +24,14 @@ class ESignatureFlutter extends StatefulWidget {
 
 class ESignatureFlutterState extends State<ESignatureFlutter> {
   final GlobalKey<SfSignaturePadState> signatureGlobalKey = GlobalKey();
+  final TextEditingController _nameController = TextEditingController();
   CameraController? _cameraController;
   late CameraDescription description = cameras[1];
   SSHClient? sshClient;
   late SftpClient sftpClient;
   bool _isConnected = false;
+  bool _isUploading = false;
+  bool _isSaving = false;
 
   @override
   void initState() {
@@ -37,7 +40,7 @@ class ESignatureFlutterState extends State<ESignatureFlutter> {
     connectSFTP();
   }
 
-Future<void> _initializeCamera() async {
+  Future<void> _initializeCamera() async {
     try {
       if (cameras.isEmpty) {
         throw Exception('No cameras available');
@@ -59,22 +62,54 @@ Future<void> _initializeCamera() async {
     }
   }
 
-  Future<void> _captureImage() async {
+  Future<void> _captureAndUploadImage() async {
     if (_cameraController == null || !_cameraController!.value.isInitialized) {
       print('Error: Camera not initialized.');
       return;
     }
 
+    setState(() {
+      _isUploading = true;
+    });
+
     try {
       final image = await _cameraController!.takePicture();
       final file = File(image.path);
-      await _uploadImage(file);
+
+      // Load the signature image
+      final signatureData =
+          await signatureGlobalKey.currentState!.toImage(pixelRatio: 3.0);
+      final signatureBytes =
+          await signatureData.toByteData(format: ui.ImageByteFormat.png);
+      final signatureUint8List = signatureBytes!.buffer.asUint8List();
+
+      // Get the name from the input field
+      final name = _nameController.text;
+
+      // Merge images
+      final mergedImage = await _mergeImages(file, signatureUint8List, name);
+
+      // Save merged image to a file
+      final directory = await getTemporaryDirectory();
+      final mergedImagePath =
+          '${directory.path}/face_with_e-signature_${DateTime.now().millisecondsSinceEpoch}.png';
+      final mergedFile = File(mergedImagePath);
+      await mergedFile.writeAsBytes(mergedImage);
+
+      // Upload the merged image
+      await _uploadImage(mergedFile);
+
+      print('Merged image uploaded successfully.');
     } catch (e) {
-      print('Error capturing image: $e');
+      print('Error capturing or uploading image: $e');
+    } finally {
+      setState(() {
+        _isUploading = false;
+      });
     }
   }
 
-Future<void> _uploadImage(File file) async {
+  Future<void> _uploadImage(File file) async {
     if (!_isConnected) {
       await connectSFTP();
     }
@@ -105,7 +140,6 @@ Future<void> _uploadImage(File file) async {
           },
         );
 
-
         await sftpFile.close();
 
         print('File uploaded successfully to $sftpPath.');
@@ -114,7 +148,6 @@ Future<void> _uploadImage(File file) async {
       }
     }
   }
-
 
   Future<void> connectSFTP() async {
     try {
@@ -128,14 +161,6 @@ Future<void> _uploadImage(File file) async {
       );
 
       sftpClient = await sshClient!.sftp();
-      // final items = await sftpClient.listdir('/');
-      // for (final item in items) {
-      //   print(item.longname);
-      // }
-
-      // sshClient!.close();
-      // await sshClient!.done;
-
       print('Connection successful.');
       setState(() {
         _isConnected = true;
@@ -156,7 +181,12 @@ Future<void> _uploadImage(File file) async {
       return;
     }
 
+    setState(() {
+      _isSaving = true;
+    });
+
     try {
+      // Save signature only
       final data =
           await signatureGlobalKey.currentState!.toImage(pixelRatio: 3.0);
       final bytes = await data.toByteData(format: ui.ImageByteFormat.png);
@@ -169,11 +199,12 @@ Future<void> _uploadImage(File file) async {
 
       await file.writeAsBytes(uint8List);
       final result = await GallerySaver.saveImage(filePath);
+
       if (result == true) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(content: Text('Signature saved to $filePath and Photos')),
         );
-        await _captureImage(); // Capture image after saving signature
+        await _captureAndUploadImage(); // Capture and upload merged image
       } else {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(content: Text('Failed to save image to Photos')),
@@ -184,7 +215,56 @@ Future<void> _uploadImage(File file) async {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text('Failed to save signature')),
       );
+    } finally {
+      setState(() {
+        _isSaving = false;
+      });
     }
+  }
+
+Future<Uint8List> _mergeImages(
+      File imageFile, Uint8List signatureBytes, String name) async {
+    final baseImage = img.decodeImage(imageFile.readAsBytesSync())!;
+    final signatureImage = img.decodeImage(signatureBytes)!;
+
+    const topMargin = 20;
+
+    final mergedImageWidth = baseImage.width;
+    final mergedImageHeight =
+        signatureImage.height + baseImage.height + topMargin;
+
+    final mergedImage =
+        img.Image(width: mergedImageWidth, height: mergedImageHeight);
+
+    final xOffsetSignature =
+        (mergedImageWidth - signatureImage.width) ~/ 50; 
+    final yOffsetSignature = 0;
+
+    img.compositeImage(mergedImage, signatureImage,
+        dstX: xOffsetSignature, dstY: yOffsetSignature);
+
+    final xOffsetBase =
+        (mergedImageWidth - baseImage.width) ~/ 2; 
+    final yOffsetBase = signatureImage.height + topMargin;
+
+    img.compositeImage(mergedImage, baseImage,
+        dstX: xOffsetBase, dstY: yOffsetBase);
+
+    final nameText = name;
+
+    final font = img.arial24;
+
+    final nameX = 20;
+    final nameY = 20;
+
+    img.drawString(mergedImage, nameText,
+        font: font,
+        x: nameX,
+        y: nameY,
+        color: img.ColorFloat64.rgb(139, 0, 0)); // Color: Dark Red
+
+    final mergedImageBytes = img.encodePng(mergedImage);
+    return Uint8List.fromList(mergedImageBytes);
   }
 
   void _handleClearButtonPressed() {
@@ -194,19 +274,44 @@ Future<void> _uploadImage(File file) async {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      body: FutureBuilder(
-        future: _initializeCamera(),
-        builder: (context, snapshot) {
-          if (snapshot.connectionState == ConnectionState.waiting) {
-            return Center(child: CircularProgressIndicator());
-          } else if (snapshot.hasError) {
-            return Center(child: Text('Error: ${snapshot.error}'));
-          } else {
-            return Column(
-              children: [
-                Padding(
-                  padding: EdgeInsets.all(10),
-                  child: Container(
+      appBar: AppBar(
+        title: Text('ESignature Flutter'),
+        backgroundColor: Colors.blueAccent,
+      ),
+      body: Center(
+        child: OrientationBuilder(
+          builder: (context, orientation) {
+            // Use MediaQuery to get screen dimensions
+            final screenSize = MediaQuery.of(context).size;
+            final isLandscape = orientation == Orientation.landscape;
+
+            return Padding(
+              padding: const EdgeInsets.all(16.0),
+              child: Column(
+                children: [
+                  // Text field for name input
+                  TextField(
+                    controller: _nameController,
+                    decoration: InputDecoration(
+                      labelText: 'Enter your name',
+                      border: OutlineInputBorder(),
+                    ),
+                    textCapitalization: TextCapitalization.words,
+                  ),
+                  SizedBox(height: 20),
+
+                  // Signature Pad with fixed height and flexible width
+                  Container(
+                    width:
+                        isLandscape ? screenSize.width * 0.9 : screenSize.width,
+                    height: isLandscape
+                        ? screenSize.height * 0.4
+                        : screenSize.height * 0.3,
+                    padding: const EdgeInsets.all(10.0),
+                    decoration: BoxDecoration(
+                      border: Border.all(color: Colors.grey),
+                      borderRadius: BorderRadius.circular(8.0),
+                    ),
                     child: SfSignaturePad(
                       key: signatureGlobalKey,
                       backgroundColor: Colors.white,
@@ -214,30 +319,29 @@ Future<void> _uploadImage(File file) async {
                       minimumStrokeWidth: 1.0,
                       maximumStrokeWidth: 4.0,
                     ),
-                    decoration:
-                        BoxDecoration(border: Border.all(color: Colors.grey)),
                   ),
-                ),
-                SizedBox(height: 10),
-                Row(
-                  children: <Widget>[
-                    TextButton(
-                      child: Text('Save to Device'),
-                      onPressed: _handleSaveButtonPressed,
-                    ),
-                    TextButton(
-                      child: Text('Clear'),
-                      onPressed: _handleClearButtonPressed,
-                    ),
-                  ],
-                  mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-                ),
-              ],
-              mainAxisAlignment: MainAxisAlignment.center,
-              crossAxisAlignment: CrossAxisAlignment.center,
+                  SizedBox(height: 20),
+                  _isSaving
+                      ? CircularProgressIndicator()
+                      : Row(
+                          mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                          children: <Widget>[
+                            ElevatedButton(
+                              onPressed: _handleSaveButtonPressed,
+                              child: Text('Save to Device'),
+                            ),
+                            ElevatedButton(
+                              onPressed: _handleClearButtonPressed,
+                              child: Text('Clear'),
+                            ),
+                          ],
+                        ),
+                  SizedBox(height: 20),
+                ],
+              ),
             );
-          }
-        },
+          },
+        ),
       ),
     );
   }
